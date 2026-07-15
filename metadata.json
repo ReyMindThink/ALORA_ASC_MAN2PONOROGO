@@ -1,0 +1,6 @@
+{
+  "name": "ALoRa IoT Dashboard",
+  "description": "Nature-inspired bright green dashboard for ALoRa (Acoustic Long Range) illegal logging detection system using ESP32, LoRa, and Firebase.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
