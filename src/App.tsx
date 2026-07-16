@@ -29,6 +29,13 @@ interface NodeSensor {
   name: string;
   lat: number;
   lng: number;
+  last_seen?: number;
+}
+
+interface PermitWindow {
+  start_ts: number;
+  end_ts: number;
+  note?: string;
 }
 
 interface AlertItem {
@@ -75,6 +82,26 @@ export default function App() {
     last_seen: Date.now() - 1000 * 15,
   });
   const [sensitivity, setSensitivity] = useState<number>(75);
+
+  // Ambang waktu untuk anggap sebuah node "mati/tidak terdeteksi": kalau last_seen
+  // sudah lebih lama dari ini, node dianggap offline (bukan cuma "aman").
+  const NODE_OFFLINE_THRESHOLD_MS = 3 * 60 * 1000; // 3 menit
+
+  // Izin tebang (permit) - jendela waktu resmi yang membuat deteksi gergaji tidak dianggap ancaman
+  const [permit, setPermit] = useState<PermitWindow | null>(null);
+  const [permitStartInput, setPermitStartInput] = useState<string>("");
+  const [permitEndInput, setPermitEndInput] = useState<string>("");
+  const [permitNoteInput, setPermitNoteInput] = useState<string>("");
+  const [isSavingPermit, setIsSavingPermit] = useState<boolean>(false);
+
+  // Manajemen node manual (tambah / edit koordinat / hapus)
+  const [newNodeId, setNewNodeId] = useState<string>("");
+  const [newNodeLat, setNewNodeLat] = useState<string>("");
+  const [newNodeLng, setNewNodeLng] = useState<string>("");
+  const [isSavingNode, setIsSavingNode] = useState<boolean>(false);
+  const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
+  const [editLat, setEditLat] = useState<string>("");
+  const [editLng, setEditLng] = useState<string>("");
 
   const [isConnected, setIsConnected] = useState<boolean>(true);
   const [isUsingMock, setIsUsingMock] = useState<boolean>(false);
@@ -138,6 +165,21 @@ export default function App() {
         const sensVal = await sensRes.json();
         if (typeof sensVal === "number") {
           setSensitivity(sensVal);
+        }
+      }
+
+      // 5. Fetch permit (izin tebang) window
+      const permitRes = await fetch(`${FIREBASE_URL}/permit.json`);
+      if (permitRes.ok) {
+        const permitData = await permitRes.json();
+        if (
+          permitData &&
+          typeof permitData.start_ts === "number" &&
+          typeof permitData.end_ts === "number"
+        ) {
+          setPermit(permitData);
+        } else {
+          setPermit(null);
         }
       }
 
@@ -209,6 +251,160 @@ export default function App() {
       console.error("Firebase ack error:", err);
     } finally {
       setIsSyncing(false);
+    }
+  };
+
+  // Simpan jendela izin tebang (tanggal & jam mulai-selesai) ke Firebase
+  const savePermit = async () => {
+    if (!permitStartInput || !permitEndInput) return;
+    const startTs = new Date(permitStartInput).getTime();
+    const endTs = new Date(permitEndInput).getTime();
+    if (isNaN(startTs) || isNaN(endTs) || endTs <= startTs) {
+      alert("Jam/tanggal selesai harus setelah jam/tanggal mulai.");
+      return;
+    }
+
+    const newPermit: PermitWindow = {
+      start_ts: startTs,
+      end_ts: endTs,
+      note: permitNoteInput || undefined,
+    };
+    setPermit(newPermit);
+
+    if (isUsingMock) return;
+
+    try {
+      setIsSavingPermit(true);
+      const res = await fetch(`${FIREBASE_URL}/permit.json`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(newPermit),
+      });
+      if (!res.ok) throw new Error("Gagal menyimpan izin tebang");
+      setLastSynced(new Date());
+    } catch (err) {
+      console.error("Firebase save permit error:", err);
+    } finally {
+      setIsSavingPermit(false);
+    }
+  };
+
+  // Hapus izin tebang yang sedang aktif/tersimpan
+  const clearPermit = async () => {
+    setPermit(null);
+    setPermitStartInput("");
+    setPermitEndInput("");
+    setPermitNoteInput("");
+
+    if (isUsingMock) return;
+
+    try {
+      setIsSavingPermit(true);
+      const res = await fetch(`${FIREBASE_URL}/permit.json`, {
+        method: "DELETE",
+      });
+      if (!res.ok) throw new Error("Gagal menghapus izin tebang");
+      setLastSynced(new Date());
+    } catch (err) {
+      console.error("Firebase clear permit error:", err);
+    } finally {
+      setIsSavingPermit(false);
+    }
+  };
+
+  // Tambah node baru secara manual (mis. sebelum alat fisik dipasang di lapangan)
+  const addNode = async () => {
+    if (!newNodeId.trim() || !newNodeLat || !newNodeLng) return;
+    const lat = Number(newNodeLat);
+    const lng = Number(newNodeLng);
+    if (isNaN(lat) || isNaN(lng)) {
+      alert("Koordinat harus berupa angka.");
+      return;
+    }
+
+    const nodeId = newNodeId.trim();
+    const newNode: NodeSensor = { name: nodeId, lat, lng };
+    setNodes((prev) => ({ ...prev, [nodeId]: newNode }));
+    setNewNodeId("");
+    setNewNodeLat("");
+    setNewNodeLng("");
+
+    if (isUsingMock) return;
+
+    try {
+      setIsSavingNode(true);
+      const res = await fetch(`${FIREBASE_URL}/nodes/${nodeId}.json`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(newNode),
+      });
+      if (!res.ok) throw new Error("Gagal menambah node");
+      setLastSynced(new Date());
+    } catch (err) {
+      console.error("Firebase add node error:", err);
+    } finally {
+      setIsSavingNode(false);
+    }
+  };
+
+  // Ubah koordinat node secara manual
+  const saveNodeCoords = async (nodeId: string) => {
+    const lat = Number(editLat);
+    const lng = Number(editLng);
+    if (isNaN(lat) || isNaN(lng)) {
+      alert("Koordinat harus berupa angka.");
+      return;
+    }
+
+    setNodes((prev) => ({
+      ...prev,
+      [nodeId]: { ...prev[nodeId], lat, lng },
+    }));
+    setEditingNodeId(null);
+
+    if (isUsingMock) return;
+
+    try {
+      setIsSavingNode(true);
+      await fetch(`${FIREBASE_URL}/nodes/${nodeId}/lat.json`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(lat),
+      });
+      await fetch(`${FIREBASE_URL}/nodes/${nodeId}/lng.json`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(lng),
+      });
+      setLastSynced(new Date());
+    } catch (err) {
+      console.error("Firebase update node coords error:", err);
+    } finally {
+      setIsSavingNode(false);
+    }
+  };
+
+  // Hapus node dari daftar (mis. duplikat atau node yang sudah tidak dipakai)
+  const deleteNode = async (nodeId: string) => {
+    setNodes((prev) => {
+      const updated = { ...prev };
+      delete updated[nodeId];
+      return updated;
+    });
+
+    if (isUsingMock) return;
+
+    try {
+      setIsSavingNode(true);
+      const res = await fetch(`${FIREBASE_URL}/nodes/${nodeId}.json`, {
+        method: "DELETE",
+      });
+      if (!res.ok) throw new Error("Gagal menghapus node");
+      setLastSynced(new Date());
+    } catch (err) {
+      console.error("Firebase delete node error:", err);
+    } finally {
+      setIsSavingNode(false);
     }
   };
 
@@ -1465,6 +1661,110 @@ export default function App() {
               </div>
             </div>
 
+            {/* Izin Tebang (Permit Scheduling) Card */}
+            <div className="bg-white border border-[#D1DBCA] rounded-4xl p-6 shadow-sm">
+              <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
+                <div>
+                  <h3 className="font-serif text-lg font-bold text-emerald-950 tracking-tight">
+                    Jadwal Izin Tebang Resmi
+                  </h3>
+                  <p className="text-xs text-stone-500 font-medium">
+                    Selama rentang waktu ini aktif, deteksi gergaji mesin tidak
+                    memicu alarm/notifikasi ilegal.
+                  </p>
+                </div>
+                <span
+                  className={`px-3 py-1 rounded-full text-xs font-mono font-bold ${
+                    permit &&
+                    Date.now() >= permit.start_ts &&
+                    Date.now() <= permit.end_ts
+                      ? "bg-amber-100 text-amber-800 border border-amber-300"
+                      : "bg-stone-100 text-stone-600 border border-stone-200"
+                  }`}
+                >
+                  {permit &&
+                  Date.now() >= permit.start_ts &&
+                  Date.now() <= permit.end_ts
+                    ? "🟡 Izin Sedang Aktif"
+                    : "⛔ Tidak Ada Izin Aktif"}
+                </span>
+              </div>
+
+              {permit && (
+                <div className="mb-4 p-3 bg-[#F2F9ED] rounded-2xl border border-[#D1DBCA]/60 text-xs text-stone-700">
+                  <div>
+                    <strong>Mulai:</strong>{" "}
+                    {new Date(permit.start_ts).toLocaleString("id-ID")}
+                  </div>
+                  <div>
+                    <strong>Selesai:</strong>{" "}
+                    {new Date(permit.end_ts).toLocaleString("id-ID")}
+                  </div>
+                  {permit.note && (
+                    <div>
+                      <strong>Catatan:</strong> {permit.note}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[10px] font-mono font-bold text-stone-500 uppercase mb-1">
+                    Mulai (tanggal &amp; jam)
+                  </label>
+                  <input
+                    type="datetime-local"
+                    value={permitStartInput}
+                    onChange={(e) => setPermitStartInput(e.target.value)}
+                    className="w-full text-sm border border-[#D1DBCA] rounded-xl px-3 py-2 focus:outline-none focus:border-emerald-400"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[10px] font-mono font-bold text-stone-500 uppercase mb-1">
+                    Selesai (tanggal &amp; jam)
+                  </label>
+                  <input
+                    type="datetime-local"
+                    value={permitEndInput}
+                    onChange={(e) => setPermitEndInput(e.target.value)}
+                    className="w-full text-sm border border-[#D1DBCA] rounded-xl px-3 py-2 focus:outline-none focus:border-emerald-400"
+                  />
+                </div>
+                <div className="sm:col-span-2">
+                  <label className="block text-[10px] font-mono font-bold text-stone-500 uppercase mb-1">
+                    Catatan (opsional, mis. nomor SK/izin)
+                  </label>
+                  <input
+                    type="text"
+                    value={permitNoteInput}
+                    onChange={(e) => setPermitNoteInput(e.target.value)}
+                    placeholder="mis. Izin Dishut No. 123/2026"
+                    className="w-full text-sm border border-[#D1DBCA] rounded-xl px-3 py-2 focus:outline-none focus:border-emerald-400"
+                  />
+                </div>
+              </div>
+
+              <div className="flex gap-2 mt-4">
+                <button
+                  onClick={savePermit}
+                  disabled={isSavingPermit}
+                  className="px-4 py-2 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold rounded-xl shadow-2xs transition-colors disabled:opacity-50"
+                >
+                  Simpan Jadwal Izin
+                </button>
+                {permit && (
+                  <button
+                    onClick={clearPermit}
+                    disabled={isSavingPermit}
+                    className="px-4 py-2 bg-white border border-[#D1DBCA] hover:bg-stone-50 text-stone-700 text-xs font-bold rounded-xl transition-colors disabled:opacity-50"
+                  >
+                    Hapus Izin
+                  </button>
+                )}
+              </div>
+            </div>
+
             {/* NEW: Animated Acoustic Fingerprint Visualizer Card */}
             <div className="bg-[#1A2C1F] text-white border border-emerald-900 rounded-4xl p-6 shadow-md relative overflow-hidden">
               <div className="absolute top-0 right-0 w-32 h-32 bg-emerald-800 rounded-full -mr-12 -mt-12 opacity-30 blur-2xl" />
@@ -1564,6 +1864,132 @@ export default function App() {
                   50% { transform: scaleY(1); }
                 }
               `}</style>
+            </div>
+
+            {/* Manajemen Node Card */}
+            <div className="bg-white border border-[#D1DBCA] rounded-4xl p-6 shadow-sm">
+              <div className="mb-4">
+                <h3 className="font-serif text-lg font-bold text-emerald-950 tracking-tight">
+                  Manajemen Node
+                </h3>
+                <p className="text-xs text-stone-500 font-medium">
+                  Tambah node baru (mis. sebelum alat dipasang di lapangan),
+                  ubah koordinat manual, atau hapus node yang tidak dipakai.
+                  Catatan: begitu node fisik mulai mengirim data lewat LoRa,
+                  gateway akan menimpa koordinat dengan data GPS asli dari
+                  firmware node tersebut.
+                </p>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-4 gap-2 mb-2">
+                <input
+                  type="text"
+                  placeholder="ID node (mis. node-3)"
+                  value={newNodeId}
+                  onChange={(e) => setNewNodeId(e.target.value)}
+                  className="text-sm border border-[#D1DBCA] rounded-xl px-3 py-2 focus:outline-none focus:border-emerald-400"
+                />
+                <input
+                  type="text"
+                  placeholder="Latitude"
+                  value={newNodeLat}
+                  onChange={(e) => setNewNodeLat(e.target.value)}
+                  className="text-sm border border-[#D1DBCA] rounded-xl px-3 py-2 focus:outline-none focus:border-emerald-400"
+                />
+                <input
+                  type="text"
+                  placeholder="Longitude"
+                  value={newNodeLng}
+                  onChange={(e) => setNewNodeLng(e.target.value)}
+                  className="text-sm border border-[#D1DBCA] rounded-xl px-3 py-2 focus:outline-none focus:border-emerald-400"
+                />
+                <button
+                  onClick={addNode}
+                  disabled={isSavingNode}
+                  className="px-4 py-2 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold rounded-xl shadow-2xs transition-colors disabled:opacity-50"
+                >
+                  + Tambah Node
+                </button>
+              </div>
+
+              <div className="divide-y divide-stone-100 mt-4">
+                {Object.entries(nodes).map(([id, node]: [string, any]) => {
+                  const isOffline =
+                    node.last_seen &&
+                    Date.now() - node.last_seen > NODE_OFFLINE_THRESHOLD_MS;
+                  return (
+                    <div
+                      key={id}
+                      className="flex flex-wrap items-center justify-between gap-2 py-3"
+                    >
+                      <div className="flex items-center gap-2 text-xs">
+                        <span
+                          className={`w-2 h-2 rounded-full ${isOffline ? "bg-stone-300" : "bg-emerald-500"}`}
+                        />
+                        <span className="font-semibold text-stone-800">
+                          {node.name || id}
+                        </span>
+                        {isOffline && (
+                          <span className="text-[10px] font-mono font-bold text-stone-500 bg-stone-100 px-2 py-0.5 rounded-full border border-stone-200">
+                            Tidak terdeteksi sejak {timeAgo(node.last_seen)}
+                          </span>
+                        )}
+                      </div>
+
+                      {editingNodeId === id ? (
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            type="text"
+                            value={editLat}
+                            onChange={(e) => setEditLat(e.target.value)}
+                            className="w-20 text-xs border border-[#D1DBCA] rounded-lg px-2 py-1"
+                          />
+                          <input
+                            type="text"
+                            value={editLng}
+                            onChange={(e) => setEditLng(e.target.value)}
+                            className="w-20 text-xs border border-[#D1DBCA] rounded-lg px-2 py-1"
+                          />
+                          <button
+                            onClick={() => saveNodeCoords(id)}
+                            className="px-2.5 py-1 bg-emerald-700 hover:bg-emerald-800 text-white text-[10px] font-bold rounded-lg"
+                          >
+                            Simpan
+                          </button>
+                          <button
+                            onClick={() => setEditingNodeId(null)}
+                            className="px-2.5 py-1 bg-stone-100 hover:bg-stone-200 text-stone-600 text-[10px] font-bold rounded-lg"
+                          >
+                            Batal
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-1.5">
+                          <span className="font-mono text-[11px] text-stone-500">
+                            {node.lat}, {node.lng}
+                          </span>
+                          <button
+                            onClick={() => {
+                              setEditingNodeId(id);
+                              setEditLat(String(node.lat));
+                              setEditLng(String(node.lng));
+                            }}
+                            className="px-2.5 py-1 bg-white border border-[#D1DBCA] hover:bg-stone-50 text-stone-600 text-[10px] font-bold rounded-lg"
+                          >
+                            Edit Koordinat
+                          </button>
+                          <button
+                            onClick={() => deleteNode(id)}
+                            className="px-2.5 py-1 bg-white border border-red-200 hover:bg-red-50 text-red-600 text-[10px] font-bold rounded-lg"
+                          >
+                            Hapus
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
             </div>
 
             {/* Acoustic Map Canvas Card */}
@@ -1704,6 +2130,7 @@ export default function App() {
                       <th className="py-3 px-2">Garis Lintang (Lat)</th>
                       <th className="py-3 px-2">Garis Bujur (Lng)</th>
                       <th className="py-3 px-2">Kondisi</th>
+                      <th className="py-3 px-2">Terakhir Aktif</th>
                       <th className="py-3 px-2 text-right">Peta GPS</th>
                     </tr>
                   </thead>
@@ -1714,6 +2141,9 @@ export default function App() {
                         (Object.values(alerts) as AlertItem[]).some(
                           (a) => a.node_id === id && !a.acknowledged,
                         );
+                      const isOffline =
+                        node.last_seen &&
+                        Date.now() - node.last_seen > NODE_OFFLINE_THRESHOLD_MS;
 
                       return (
                         <tr
@@ -1723,7 +2153,13 @@ export default function App() {
                           <td className="py-4 px-2 font-semibold text-stone-850">
                             <span className="flex items-center gap-2.5">
                               <span
-                                className={`w-2.5 h-2.5 rounded-full ${isNodeAlerting ? "bg-red-500 animate-pulse" : "bg-emerald-500"}`}
+                                className={`w-2.5 h-2.5 rounded-full ${
+                                  isNodeAlerting
+                                    ? "bg-red-500 animate-pulse"
+                                    : isOffline
+                                      ? "bg-stone-300"
+                                      : "bg-emerald-500"
+                                }`}
                               />
                               {node.name || id}
                             </span>
@@ -1739,11 +2175,20 @@ export default function App() {
                               className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-mono font-semibold ${
                                 isNodeAlerting
                                   ? "bg-red-50 text-red-800 border border-red-200"
-                                  : "bg-emerald-50 text-emerald-800 border border-emerald-100"
+                                  : isOffline
+                                    ? "bg-stone-100 text-stone-600 border border-stone-200"
+                                    : "bg-emerald-50 text-emerald-800 border border-emerald-100"
                               }`}
                             >
-                              {isNodeAlerting ? "🚨 Terancam" : "✅ Aman"}
+                              {isNodeAlerting
+                                ? "🚨 Terancam"
+                                : isOffline
+                                  ? "⚪ Tidak Terdeteksi"
+                                  : "✅ Aman"}
                             </span>
+                          </td>
+                          <td className="py-4 px-2 font-mono text-[11px] text-stone-500">
+                            {node.last_seen ? timeAgo(node.last_seen) : "–"}
                           </td>
                           <td className="py-4 px-2 text-right">
                             <a
