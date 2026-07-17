@@ -55,7 +55,7 @@ export default function App() {
   const FIREBASE_HOST =
     "lora-c0e72-default-rtdb.asia-southeast1.firebasedatabase.app";
   const FIREBASE_URL =
-    "lora-c0e72-default-rtdb.asia-southeast1.firebasedatabase.app";
+    "https://lora-c0e72-default-rtdb.asia-southeast1.firebasedatabase.app";
 
   // State
   const [nodes, setNodes] = useState<Record<string, NodeSensor>>({
