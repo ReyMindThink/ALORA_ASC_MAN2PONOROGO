@@ -26,9 +26,9 @@ import { motion, AnimatePresence } from "motion/react";
 
 // Types matching Arduino structures
 interface NodeSensor {
-  name: string;
-  lat: number;
-  lng: number;
+  name?: string;
+  lat?: number;
+  lng?: number;
   last_seen?: number;
   detected?: boolean; // status LIVE dari paket LoRa terakhir node ini (bukan riwayat alert)
 }
@@ -433,6 +433,49 @@ export default function App() {
     }
   };
 
+  // Daftarkan/lengkapi node yang SUDAH otomatis muncul di Firebase (karena
+  // gateway pernah meneruskan minimal 1 paket dari node itu) tapi BELUM
+  // punya nama & koordinat -- ini alur pendaftaran yang benar: node aktif
+  // dulu (terdeteksi gateway), baru admin isi nama kustom + lokasi GPS
+  // sebenarnya di lapangan lewat web. Setelah diisi di sini, gateway tidak
+  // akan pernah menimpa nilai ini lagi (lihat catatan PATCH di firmware).
+  const [regNameInput, setRegNameInput] = useState<Record<string, string>>({});
+  const [regLatInput, setRegLatInput] = useState<Record<string, string>>({});
+  const [regLngInput, setRegLngInput] = useState<Record<string, string>>({});
+  const [isRegistering, setIsRegistering] = useState<string | null>(null);
+
+  const registerNode = async (nodeId: string) => {
+    const name = (regNameInput[nodeId] || "").trim();
+    const lat = Number(regLatInput[nodeId]);
+    const lng = Number(regLngInput[nodeId]);
+    if (!name || isNaN(lat) || isNaN(lng)) {
+      alert("Isi nama dan koordinat (harus berupa angka) terlebih dahulu.");
+      return;
+    }
+
+    setNodes((prev) => ({
+      ...prev,
+      [nodeId]: { ...prev[nodeId], name, lat, lng },
+    }));
+
+    if (isUsingMock) return;
+
+    try {
+      setIsRegistering(nodeId);
+      const res = await fetch(`${FIREBASE_URL}/nodes/${nodeId}.json`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, lat, lng }),
+      });
+      if (!res.ok) throw new Error("Gagal mendaftarkan node");
+      setLastSynced(new Date());
+    } catch (err) {
+      console.error("Firebase register node error:", err);
+    } finally {
+      setIsRegistering(null);
+    }
+  };
+
   // Tambah node baru secara manual (mis. sebelum alat fisik dipasang di lapangan)
   const addNode = async () => {
     if (!newNodeId.trim() || !newNodeLat || !newNodeLng) return;
@@ -695,6 +738,19 @@ export default function App() {
   };
 
   // Derived Values
+  // Node yang sudah otomatis muncul (gateway pernah meneruskan datanya) tapi
+  // belum diisi nama & koordinat oleh admin -- ini yang ditampilkan di panel
+  // "Node Terdeteksi, Perlu Didaftarkan".
+  const unregisteredNodeEntries = Object.entries(nodes).filter(
+    ([, n]: [string, any]) => n.lat == null || n.lng == null,
+  );
+  // Kebalikannya: node yang sudah lengkap didaftarkan (punya nama & koordinat)
+  // -- ini yang ditampilkan di daftar/manajemen/peta, supaya tidak dobel
+  // dengan panel "Perlu Didaftarkan" di atas.
+  const registeredNodeEntries = Object.entries(nodes).filter(
+    ([, n]: [string, any]) => n.lat != null && n.lng != null,
+  );
+
   const alertList = (Object.values(alerts) as AlertItem[]).sort(
     (a, b) => b.timestamp - a.timestamp,
   );
@@ -2016,6 +2072,88 @@ export default function App() {
               `}</style>
             </div>
 
+            {/* Node Terdeteksi, Perlu Didaftarkan */}
+            {/* Panel ini yang menjawab alur yang benar: node sensor aktif ->
+                gateway meneruskan paket pertamanya -> node OTOMATIS muncul di
+                Firebase (via PATCH) HANYA dengan status hidup, TANPA nama/lokasi
+                -> baru di sinilah admin memberi nama kustom + koordinat GPS
+                sebenarnya di lapangan. Setelah didaftarkan, gateway tidak akan
+                pernah menimpa nama/koordinat itu lagi. */}
+            {unregisteredNodeEntries.length > 0 && (
+              <div className="bg-amber-50 border border-amber-200 rounded-4xl p-6 shadow-sm">
+                <div className="mb-4">
+                  <h3 className="font-serif text-lg font-bold text-amber-900 tracking-tight flex items-center gap-2">
+                    <Sparkles className="w-4 h-4" />
+                    Node Terdeteksi, Perlu Didaftarkan
+                  </h3>
+                  <p className="text-xs text-amber-800/80 font-medium">
+                    Node ini sudah aktif mengirim data lewat gateway (ID
+                    perangkatnya tetap/tidak bisa diubah), tapi belum punya nama
+                    & koordinat. Isi dulu di bawah ini supaya muncul di peta
+                    &amp; daftar node.
+                  </p>
+                </div>
+
+                <div className="space-y-3">
+                  {unregisteredNodeEntries.map(([id]) => (
+                    <div
+                      key={id}
+                      className="grid grid-cols-1 sm:grid-cols-4 gap-2 items-center bg-white border border-amber-200 rounded-2xl p-3"
+                    >
+                      <span className="font-mono text-xs font-bold text-amber-900">
+                        ID: {id}
+                      </span>
+                      <input
+                        type="text"
+                        placeholder="Nama kustom"
+                        value={regNameInput[id] || ""}
+                        onChange={(e) =>
+                          setRegNameInput((prev) => ({
+                            ...prev,
+                            [id]: e.target.value,
+                          }))
+                        }
+                        className="text-sm border border-[#D1DBCA] rounded-xl px-3 py-2 focus:outline-none focus:border-emerald-400"
+                      />
+                      <input
+                        type="text"
+                        placeholder="Latitude"
+                        value={regLatInput[id] || ""}
+                        onChange={(e) =>
+                          setRegLatInput((prev) => ({
+                            ...prev,
+                            [id]: e.target.value,
+                          }))
+                        }
+                        className="text-sm border border-[#D1DBCA] rounded-xl px-3 py-2 focus:outline-none focus:border-emerald-400"
+                      />
+                      <div className="flex gap-2">
+                        <input
+                          type="text"
+                          placeholder="Longitude"
+                          value={regLngInput[id] || ""}
+                          onChange={(e) =>
+                            setRegLngInput((prev) => ({
+                              ...prev,
+                              [id]: e.target.value,
+                            }))
+                          }
+                          className="flex-1 text-sm border border-[#D1DBCA] rounded-xl px-3 py-2 focus:outline-none focus:border-emerald-400"
+                        />
+                        <button
+                          onClick={() => registerNode(id)}
+                          disabled={isRegistering === id}
+                          className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-xl shadow-2xs transition-colors disabled:opacity-50 whitespace-nowrap"
+                        >
+                          Daftarkan
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {/* Manajemen Node Card */}
             <div className="bg-white border border-[#D1DBCA] rounded-4xl p-6 shadow-sm">
               <div className="mb-4">
@@ -2023,11 +2161,13 @@ export default function App() {
                   Manajemen Node
                 </h3>
                 <p className="text-xs text-stone-500 font-medium">
-                  Tambah node baru (mis. sebelum alat dipasang di lapangan),
-                  ubah koordinat manual, atau hapus node yang tidak dipakai.
-                  Catatan: begitu node fisik mulai mengirim data lewat LoRa,
-                  gateway akan menimpa koordinat dengan data GPS asli dari
-                  firmware node tersebut.
+                  Node fisik yang sudah aktif otomatis muncul di panel "Perlu
+                  Didaftarkan" di atas begitu gateway menerima paket pertamanya
+                  -- daftarkan nama &amp; koordinatnya di sana. Form di bawah
+                  ini untuk kasus lain: menambah node secara manual sebelum alat
+                  dipasang, mengubah koordinat/nama node yang sudah terdaftar,
+                  atau menghapus node yang tidak dipakai. Gateway tidak akan
+                  pernah menimpa nama/koordinat yang sudah kamu isi di sini.
                 </p>
               </div>
 
@@ -2063,7 +2203,7 @@ export default function App() {
               </div>
 
               <div className="divide-y divide-stone-100 mt-4">
-                {Object.entries(nodes).map(([id, node]: [string, any]) => {
+                {registeredNodeEntries.map(([id, node]: [string, any]) => {
                   const isOffline =
                     node.last_seen &&
                     Date.now() - node.last_seen > NODE_OFFLINE_THRESHOLD_MS;
@@ -2215,7 +2355,7 @@ export default function App() {
                   </div>
 
                   {/* Render nodes onto stylized grid */}
-                  {Object.entries(nodes).map(
+                  {registeredNodeEntries.map(
                     ([id, node]: [string, any], idx) => {
                       const nodeIsFresh =
                         !!node.last_seen &&
@@ -2326,7 +2466,7 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody className="text-sm divide-y divide-stone-100">
-                    {Object.entries(nodes).map(([id, node]: [string, any]) => {
+                    {registeredNodeEntries.map(([id, node]: [string, any]) => {
                       const isOffline =
                         !node.last_seen ||
                         Date.now() - node.last_seen > NODE_OFFLINE_THRESHOLD_MS;
