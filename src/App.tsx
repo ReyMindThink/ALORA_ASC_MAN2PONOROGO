@@ -30,12 +30,24 @@ interface NodeSensor {
   lat: number;
   lng: number;
   last_seen?: number;
+  detected?: boolean; // status LIVE dari paket LoRa terakhir node ini (bukan riwayat alert)
 }
 
 interface PermitWindow {
   start_ts: number;
   end_ts: number;
   note?: string;
+}
+
+// Satu entri riwayat izin tebang yang PERNAH dibuat (bukan cuma yang sedang
+// aktif) -- disimpan terpisah dari /permit.json (yang cuma menyimpan 1 jadwal
+// aktif) supaya bisa dihitung berapa kali izin tebang pernah diterbitkan.
+interface PermitHistoryEntry {
+  id: string;
+  start_ts: number;
+  end_ts: number;
+  note?: string;
+  created_at: number;
 }
 
 interface AlertItem {
@@ -55,32 +67,19 @@ export default function App() {
   const FIREBASE_HOST =
     "lora-c0e72-default-rtdb.asia-southeast1.firebasedatabase.app";
   const FIREBASE_URL =
-    "lora-c0e72-default-rtdb.asia-southeast1.firebasedatabase.app";
+    "https://lora-c0e72-default-rtdb.asia-southeast1.firebasedatabase.app";
 
   // State
-  const [nodes, setNodes] = useState<Record<string, NodeSensor>>({
-    "node-1": { name: "node-1", lat: -6.99, lng: 110.42 },
-    "node-2": { name: "node-2", lat: -6.9921, lng: 110.4225 },
-  });
-  const [alerts, setAlerts] = useState<Record<string, AlertItem>>({
-    "alert-init-1": {
-      id: "alert-init-1",
-      node_id: "node-1",
-      timestamp: Date.now() - 1000 * 60 * 12, // 12 mins ago
-      confidence: 88,
-      acknowledged: true,
-    },
-    "alert-init-2": {
-      id: "alert-init-2",
-      node_id: "node-2",
-      timestamp: Date.now() - 1000 * 60 * 45, // 45 mins ago
-      confidence: 94,
-      acknowledged: true,
-    },
-  });
-  const [status, setStatus] = useState<FirebaseStatus>({
-    last_seen: Date.now() - 1000 * 15,
-  });
+  // PERBAIKAN: sebelumnya di sini ada data bohongan (node-1/node-2 dengan
+  // koordinat karangan + 2 alert palsu "12 menit lalu"/"45 menit lalu") yang
+  // langsung tampil begitu web dibuka, SEBELUM sempat fetch ke Firebase.
+  // Ini yang bikin dashboard terkesan "mengada-ada" -- padahal cuma ada 1 node
+  // sungguhan. Sekarang mulai kosong; apa pun yang tampil murni hasil fetch
+  // dari Firebase (data node sungguhan akan otomatis muncul begitu gateway
+  // pernah meneruskan minimal 1 paket dari node tersebut).
+  const [nodes, setNodes] = useState<Record<string, NodeSensor>>({});
+  const [alerts, setAlerts] = useState<Record<string, AlertItem>>({});
+  const [status, setStatus] = useState<FirebaseStatus>({ last_seen: 0 });
   const [sensitivity, setSensitivity] = useState<number>(75);
 
   // Ambang waktu untuk anggap sebuah node "mati/tidak terdeteksi": kalau last_seen
@@ -93,6 +92,18 @@ export default function App() {
   const [permitEndInput, setPermitEndInput] = useState<string>("");
   const [permitNoteInput, setPermitNoteInput] = useState<string>("");
   const [isSavingPermit, setIsSavingPermit] = useState<boolean>(false);
+
+  // Riwayat izin tebang (semua izin yang PERNAH dibuat, bukan cuma yang aktif)
+  const [permitHistory, setPermitHistory] = useState<
+    Record<string, PermitHistoryEntry>
+  >({});
+
+  // Edit nama kustom node (ID hardware tetap, cuma label tampilan yang bisa diganti)
+  const [editingNameNodeId, setEditingNameNodeId] = useState<string | null>(
+    null,
+  );
+  const [editNameValue, setEditNameValue] = useState<string>("");
+  const [isSavingName, setIsSavingName] = useState<boolean>(false);
 
   // Manajemen node manual (tambah / edit koordinat / hapus)
   const [newNodeId, setNewNodeId] = useState<string>("");
@@ -188,6 +199,31 @@ export default function App() {
         }
       }
 
+      // 6. Fetch riwayat izin tebang (semua izin yang pernah dibuat, untuk histori)
+      const permitHistoryRes = await fetch(
+        `${FIREBASE_URL}/permit_history.json`,
+      );
+      if (permitHistoryRes.ok) {
+        const permitHistoryData = await permitHistoryRes.json();
+        if (permitHistoryData) {
+          const normalizedHistory: Record<string, PermitHistoryEntry> = {};
+          Object.entries(permitHistoryData).forEach(
+            ([key, val]: [string, any]) => {
+              normalizedHistory[key] = {
+                id: key,
+                start_ts: val.start_ts,
+                end_ts: val.end_ts,
+                note: val.note,
+                created_at: val.created_at || val.start_ts,
+              };
+            },
+          );
+          setPermitHistory(normalizedHistory);
+        } else {
+          setPermitHistory({});
+        }
+      }
+
       // Fetch berhasil penuh: reset penghitung kegagalan dan kembalikan dashboard
       // ke mode data asli (kalau sebelumnya sempat jatuh ke simulasi).
       consecutiveFailuresRef.current = 0;
@@ -211,12 +247,11 @@ export default function App() {
       console.warn("Firebase fetch error:", err);
       setSyncError(diagnosis);
 
-      // Hanya jatuh ke Modus Simulasi kalau gagal berturut-turut, bukan sekali
-      // gagal saja -- supaya blip jaringan sesaat tidak bikin dashboard
-      // kelihatan seperti data palsu padahal sebenarnya cuma telat sinkron.
+      // VERSI MURNI: tidak pernah beralih ke data tiruan/simulasi. Kalau gagal
+      // konek berkali-kali, dashboard cuma menampilkan status "Tidak
+      // Terhubung" apa adanya -- tidak ada fallback data palsu sama sekali.
       if (consecutiveFailuresRef.current >= MAX_CONSECUTIVE_FAILURES) {
         setIsConnected(false);
-        setIsUsingMock(true);
       }
     } finally {
       setIsSyncing(false);
@@ -305,11 +340,73 @@ export default function App() {
         body: JSON.stringify(newPermit),
       });
       if (!res.ok) throw new Error("Gagal menyimpan izin tebang");
+
+      // Catat juga ke /permit_history.json (push -> id unik otomatis) supaya
+      // izin ini tetap tercatat di riwayat walau nanti jadwal aktifnya
+      // ditimpa jadwal baru atau dihapus lewat "Hapus Izin".
+      const historyRes = await fetch(`${FIREBASE_URL}/permit_history.json`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...newPermit, created_at: Date.now() }),
+      });
+      if (historyRes.ok) {
+        const { name: pushedKey } = await historyRes.json();
+        setPermitHistory((prev) => ({
+          ...prev,
+          [pushedKey]: {
+            id: pushedKey,
+            ...newPermit,
+            created_at: Date.now(),
+          },
+        }));
+      }
+
       setLastSynced(new Date());
     } catch (err) {
       console.error("Firebase save permit error:", err);
     } finally {
       setIsSavingPermit(false);
+    }
+  };
+
+  // Hapus satu entri riwayat izin tebang tertentu
+  const deletePermitHistoryEntry = async (entryId: string) => {
+    setPermitHistory((prev) => {
+      const updated = { ...prev };
+      delete updated[entryId];
+      return updated;
+    });
+
+    if (isUsingMock) return;
+
+    try {
+      const res = await fetch(
+        `${FIREBASE_URL}/permit_history/${entryId}.json`,
+        { method: "DELETE" },
+      );
+      if (!res.ok) throw new Error("Gagal menghapus riwayat izin");
+      setLastSynced(new Date());
+    } catch (err) {
+      console.error("Firebase delete permit history error:", err);
+    }
+  };
+
+  // Hapus SELURUH riwayat izin tebang
+  const clearAllPermitHistory = async () => {
+    if (!confirm("Hapus seluruh riwayat izin tebang? Tindakan ini permanen."))
+      return;
+    setPermitHistory({});
+
+    if (isUsingMock) return;
+
+    try {
+      const res = await fetch(`${FIREBASE_URL}/permit_history.json`, {
+        method: "DELETE",
+      });
+      if (!res.ok) throw new Error("Gagal menghapus riwayat izin");
+      setLastSynced(new Date());
+    } catch (err) {
+      console.error("Firebase clear permit history error:", err);
     }
   };
 
@@ -408,6 +505,40 @@ export default function App() {
     }
   };
 
+  // Simpan nama kustom (label tampilan) untuk sebuah node. ID node itu sendiri
+  // (kunci "nodeId" di Firebase, mis. "node-1") berasal dari #define NODE_ID
+  // di firmware ESP32 dan TIDAK BISA diganti dari sini -- yang bisa diubah
+  // cuma field "name"-nya. Karena gateway sekarang mem-PATCH (bukan PUT)
+  // path /nodes/{id}, nama yang disimpan di sini tidak akan tertimpa balik
+  // oleh paket telemetry berikutnya dari node sensor.
+  const saveNodeName = async (nodeId: string) => {
+    const trimmed = editNameValue.trim();
+    if (!trimmed) return;
+
+    setNodes((prev) => ({
+      ...prev,
+      [nodeId]: { ...prev[nodeId], name: trimmed },
+    }));
+    setEditingNameNodeId(null);
+
+    if (isUsingMock) return;
+
+    try {
+      setIsSavingName(true);
+      const res = await fetch(`${FIREBASE_URL}/nodes/${nodeId}/name.json`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(trimmed),
+      });
+      if (!res.ok) throw new Error("Gagal menyimpan nama node");
+      setLastSynced(new Date());
+    } catch (err) {
+      console.error("Firebase save node name error:", err);
+    } finally {
+      setIsSavingName(false);
+    }
+  };
+
   // Hapus node dari daftar (mis. duplikat atau node yang sudah tidak dipakai)
   const deleteNode = async (nodeId: string) => {
     setNodes((prev) => {
@@ -432,50 +563,51 @@ export default function App() {
     }
   };
 
-  // Simulator helper: Trigger mock warning on a node
-  const triggerMockAlert = async (nodeId: string) => {
-    const timestamp = Date.now();
-    const confidence = Math.floor(Math.random() * 25) + 75; // 75% to 99%
-    const newAlert = {
-      node_id: nodeId,
-      timestamp,
-      confidence,
-      acknowledged: false,
-    };
+  // VERSI MURNI: fungsi picu alarm palsu (triggerMockAlert) sengaja DIHAPUS.
+  // Semua entri di /alerts.json pada versi ini hanya bisa berasal dari
+  // gateway asli meneruskan deteksi node sensor asli -- tidak ada jalur di
+  // web ini yang bisa menulis alert karangan.
 
-    if (isUsingMock) {
-      // Local state simulation
-      const mockKey = `alert-mock-${Date.now()}`;
-      setAlerts((prev) => ({
-        ...prev,
-        [mockKey]: { id: mockKey, ...newAlert },
-      }));
-      setStatus((prev) => ({ ...prev, last_seen: timestamp }));
-    } else {
-      try {
-        setIsSyncing(true);
-        // POST alert
-        await fetch(`${FIREBASE_URL}/alerts.json`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(newAlert),
-        });
-        // PUT last seen status
-        await fetch(`${FIREBASE_URL}/status/last_seen.json`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ last_seen: timestamp }),
-        });
-        fetchData();
-      } catch (err) {
-        console.error("Simulator triggers error:", err);
-      } finally {
-        setIsSyncing(false);
-      }
+  // Clear or acknowledge all alerts in simulator
+  // PERBAIKAN: sebelumnya cuma ada "Acknowledge Semua Alarm" yang meng-ack
+  // SELURUH alert dari SEMUA node sekaligus -- kalau ada 2 node aktif dan yang
+  // baru diatasi cuma satu, tombol ini keliru ikut menandai node lain sebagai
+  // sudah ditinjau juga. Fungsi ini hanya meng-ack log milik SATU node_id.
+  const acknowledgeNodeAlerts = async (nodeId: string) => {
+    const idsToAck = Object.entries(alerts)
+      .filter(([, a]: [string, any]) => a.node_id === nodeId && !a.acknowledged)
+      .map(([key]) => key);
+    if (idsToAck.length === 0) return;
+
+    setAlerts((prev) => {
+      const updated = { ...prev };
+      idsToAck.forEach((key) => {
+        updated[key] = { ...updated[key], acknowledged: true };
+      });
+      return updated;
+    });
+
+    if (isUsingMock) return;
+
+    try {
+      setIsSyncing(true);
+      await Promise.all(
+        idsToAck.map((key) =>
+          fetch(`${FIREBASE_URL}/alerts/${key}/acknowledged.json`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(true),
+          }),
+        ),
+      );
+      fetchData();
+    } catch (err) {
+      console.error("Firebase ack per-node error:", err);
+    } finally {
+      setIsSyncing(false);
     }
   };
 
-  // Clear or acknowledge all alerts in simulator
   const clearAllAlerts = async () => {
     if (isUsingMock) {
       setAlerts((prev) => {
@@ -508,6 +640,60 @@ export default function App() {
     }
   };
 
+  // Hapus SATU log data ancaman/alarm secara permanen dari Firebase (berbeda
+  // dari acknowledgeAlert, yang cuma menandai "sudah ditinjau" tapi tetap
+  // menyimpan catatannya).
+  const deleteAlert = async (alertId: string) => {
+    setAlerts((prev) => {
+      const updated = { ...prev };
+      delete updated[alertId];
+      return updated;
+    });
+
+    if (isUsingMock) return;
+
+    try {
+      setIsSyncing(true);
+      const res = await fetch(`${FIREBASE_URL}/alerts/${alertId}.json`, {
+        method: "DELETE",
+      });
+      if (!res.ok) throw new Error("Gagal menghapus data ancaman");
+      setLastSynced(new Date());
+    } catch (err) {
+      console.error("Firebase delete alert error:", err);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  // Hapus SELURUH data ancaman/log alarm secara permanen (beda dari
+  // "Tandai Semua Aman" di atas, yang hanya meng-ack tanpa menghapus).
+  const deleteAllAlertsData = async () => {
+    if (
+      !confirm(
+        "Hapus SELURUH data ancaman/log alarm secara permanen? Tindakan ini tidak bisa dibatalkan.",
+      )
+    )
+      return;
+
+    setAlerts({});
+
+    if (isUsingMock) return;
+
+    try {
+      setIsSyncing(true);
+      const res = await fetch(`${FIREBASE_URL}/alerts.json`, {
+        method: "DELETE",
+      });
+      if (!res.ok) throw new Error("Gagal menghapus seluruh data ancaman");
+      setLastSynced(new Date());
+    } catch (err) {
+      console.error("Firebase delete all alerts error:", err);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
   // Derived Values
   const alertList = (Object.values(alerts) as AlertItem[]).sort(
     (a, b) => b.timestamp - a.timestamp,
@@ -515,10 +701,25 @@ export default function App() {
   const unacknowledgedAlerts = alertList.filter(
     (a: AlertItem) => !a.acknowledged,
   );
-  const hasActiveAlert = unacknowledgedAlerts.length > 0;
 
-  // Most recent fresh alert (within last 10 minutes) or simply any active alert
-  const latestActiveAlert: AlertItem | null = unacknowledgedAlerts[0] || null;
+  // PERBAIKAN PENTING: dulu status "AMAN/TERANCAM" ditentukan dari ada/tidaknya
+  // ALERT LAMA yang belum di-"Konfirmasi" -- akibatnya begitu 1 alert (baik
+  // asli maupun dari tombol simulasi) pernah tercatat dan tidak ada yang klik
+  // Konfirmasi, dashboard akan MENAMPILKAN "TERANCAM" SELAMANYA walau ancaman
+  // sudah lama selesai. Sekarang status real-time murni dilihat dari kondisi
+  // LIVE tiap node (field `detected` dari paket LoRa TERAKHIR + apakah node itu
+  // masih "hidup" dalam NODE_OFFLINE_THRESHOLD_MS terakhir) -- begitu node
+  // sensor sendiri melaporkan detected=false (situasi sudah reda), status di
+  // web otomatis kembali AMAN tanpa perlu ada yang klik apa pun secara manual.
+  // Riwayat alert (unacknowledgedAlerts) tetap ada, tapi sekarang murni jadi
+  // LOG/catatan kejadian untuk ditinjau -- tidak lagi mengontrol status utama.
+  const liveThreatEntries = Object.entries(nodes).filter(([, n]) => {
+    const isFresh =
+      !!n.last_seen && Date.now() - n.last_seen < NODE_OFFLINE_THRESHOLD_MS;
+    return n.detected === true && isFresh;
+  });
+  const hasActiveAlert = liveThreatEntries.length > 0;
+  const latestActiveNodeId: string | null = liveThreatEntries[0]?.[0] ?? null;
 
   // Formatting helpers
   const timeAgo = (unixMs: number) => {
@@ -1200,20 +1401,20 @@ export default function App() {
               <span
                 className={`w-2 h-2 rounded-full ${isConnected ? "bg-emerald-500 animate-pulse" : "bg-amber-500"}`}
               />
-              {isConnected ? "Sistem Online" : "Modus Lokal Terisolasi"}
+              {isConnected ? "Sistem Online" : "Terputus dari Firebase"}
             </span>
 
-            {isUsingMock && (
+            {!isConnected && (
               <span
                 className="inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-mono font-medium bg-amber-100 text-amber-900 border border-amber-200 cursor-help"
                 title={syncError ?? "Gagal terhubung ke Firebase berkali-kali."}
               >
-                <Sparkles className="w-3.5 h-3.5" />
-                Menggunakan Data Simulasi Cepat
+                <WifiOff className="w-3.5 h-3.5" />
+                Tidak ada data real -- cek koneksi/Firebase Rules
               </span>
             )}
           </div>
-          {isUsingMock && syncError && (
+          {!isConnected && syncError && (
             <p className="text-xs text-amber-700 font-mono mt-1">{syncError}</p>
           )}
 
@@ -1396,8 +1597,8 @@ export default function App() {
                   </div>
                   <p className="text-stone-500 text-sm mt-2 max-w-xl">
                     {hasActiveAlert
-                      ? `Ancaman gergaji mesin aktif dilaporkan di Node ${latestActiveAlert?.node_id}. Amplitudo suara terindikasi tinggi. Segera arahkan tim patroli rimbawan ke koordinat lokasi.`
-                      : "Sistem akustik tidak menangkap adanya sinyal frekuensi abnormal yang menyerupai gergaji mesin (chainsaw). Konservasi hutan aman dari pembalakan liar."}
+                      ? `Gergaji mesin SEDANG terdeteksi live di Node ${latestActiveNodeId}. Segera arahkan tim patroli rimbawan ke koordinat lokasi. Status ini otomatis kembali AMAN begitu node melaporkan situasi reda.`
+                      : "Sistem akustik tidak menangkap adanya sinyal frekuensi abnormal yang menyerupai gergaji mesin (chainsaw) dari node yang sedang online. Konservasi hutan aman dari pembalakan liar."}
                   </p>
                 </div>
 
@@ -1409,21 +1610,19 @@ export default function App() {
                     <p
                       className={`text-lg font-bold italic ${hasActiveAlert ? "text-red-700" : "text-slate-700"}`}
                     >
-                      {hasActiveAlert && latestActiveAlert
-                        ? `Node ${latestActiveAlert.node_id}`
+                      {hasActiveAlert && latestActiveNodeId
+                        ? `Node ${latestActiveNodeId}`
                         : "Tidak Ada"}
                     </p>
                   </div>
                   <div>
                     <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-                      Confidence Score
+                      Alert Belum Ditinjau
                     </p>
                     <p
-                      className={`text-lg font-bold ${hasActiveAlert && latestActiveAlert ? "text-red-600" : "text-emerald-600"}`}
+                      className={`text-lg font-bold ${unacknowledgedAlerts.length > 0 ? "text-amber-600" : "text-emerald-600"}`}
                     >
-                      {hasActiveAlert && latestActiveAlert
-                        ? `${latestActiveAlert.confidence}%`
-                        : "0.02%"}
+                      {unacknowledgedAlerts.length}
                     </p>
                   </div>
                 </div>
@@ -1490,148 +1689,6 @@ export default function App() {
               <span>915 MHz LoRa</span>
             </div>
           </div>
-        </div>
-
-        {/* Developer Sandbox Panel - Collapsible */}
-        <div className="mb-8 bg-white border border-[#D1DBCA] rounded-3xl overflow-hidden shadow-xs">
-          <button
-            onClick={() => setShowSandbox(!showSandbox)}
-            className="w-full px-6 py-5 bg-[#E8F0E3]/60 flex justify-between items-center text-left hover:bg-[#E8F0E3] transition-all duration-300 border-t border-[#D1DBCA]"
-          >
-            <div className="flex items-center gap-3 text-emerald-950">
-              <div className="p-2 bg-white rounded-xl shadow-xs text-emerald-800">
-                <Sliders className="w-4 h-4" />
-              </div>
-              <div>
-                <span className="font-serif font-bold text-sm tracking-tight">
-                  🛠️ Ruang Simulasi &amp; Pengetesan Alat (Sandbox)
-                </span>
-                <p className="text-[11px] text-stone-500 font-normal">
-                  Picu sinyal tiruan untuk mencoba fungsionalitas visual web
-                  dashboard Anda
-                </p>
-              </div>
-            </div>
-            {showSandbox ? (
-              <ChevronUp className="w-4 h-4 text-stone-600" />
-            ) : (
-              <ChevronDown className="w-4 h-4 text-stone-600" />
-            )}
-          </button>
-
-          <AnimatePresence>
-            {showSandbox && (
-              <motion.div
-                initial={{ height: 0, opacity: 0 }}
-                animate={{ height: "auto", opacity: 1 }}
-                exit={{ height: 0, opacity: 0 }}
-                className="overflow-hidden border-t border-[#D1DBCA]"
-              >
-                <div className="p-6 grid grid-cols-1 md:grid-cols-3 gap-6 bg-white">
-                  {/* Column 1 */}
-                  <div>
-                    <h4 className="text-xs font-bold font-mono text-slate-400 uppercase tracking-wider mb-2">
-                      Picu Alarm Palsu
-                    </h4>
-                    <div className="flex flex-col gap-2">
-                      <button
-                        onClick={() => triggerMockAlert("node-1")}
-                        className="w-full text-left px-3 py-2.5 rounded-xl text-xs font-semibold bg-red-50 text-red-800 border border-red-200 hover:bg-red-100 transition-colors flex justify-between items-center cursor-pointer"
-                      >
-                        <span>Picu Chainsaw di Node-1</span>
-                        <span className="font-mono text-[9px] bg-red-200/60 px-1.5 py-0.5 rounded font-bold">
-                          Trigger
-                        </span>
-                      </button>
-                      <button
-                        onClick={() => triggerMockAlert("node-2")}
-                        className="w-full text-left px-3 py-2.5 rounded-xl text-xs font-semibold bg-red-50 text-red-800 border border-red-200 hover:bg-red-100 transition-colors flex justify-between items-center cursor-pointer"
-                      >
-                        <span>Picu Chainsaw di Node-2</span>
-                        <span className="font-mono text-[9px] bg-red-200/60 px-1.5 py-0.5 rounded font-bold">
-                          Trigger
-                        </span>
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Column 2 */}
-                  <div>
-                    <h4 className="text-xs font-bold font-mono text-slate-400 uppercase tracking-wider mb-2">
-                      Reset Status Hutan
-                    </h4>
-                    <div className="flex flex-col gap-2">
-                      <button
-                        onClick={clearAllAlerts}
-                        className="w-full text-left px-3 py-2.5 rounded-xl text-xs font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 hover:bg-emerald-100 transition-colors flex justify-between items-center cursor-pointer"
-                      >
-                        <span>Acknowledge Semua Alarm</span>
-                        <span className="font-mono text-[9px] bg-emerald-200/60 px-1.5 py-0.5 rounded font-bold">
-                          Reset
-                        </span>
-                      </button>
-
-                      <button
-                        onClick={() => {
-                          setStatus({ last_seen: Date.now() });
-                          if (!isUsingMock) {
-                            fetch(`${FIREBASE_URL}/status/last_seen.json`, {
-                              method: "PUT",
-                              headers: { "Content-Type": "application/json" },
-                              body: JSON.stringify({ last_seen: Date.now() }),
-                            });
-                          }
-                        }}
-                        className="w-full text-left px-3 py-2.5 rounded-xl text-xs font-semibold bg-stone-50 text-stone-700 border border-stone-200 hover:bg-stone-100 transition-colors flex justify-between items-center cursor-pointer"
-                      >
-                        <span>Picu Ping Gateway (Now)</span>
-                        <span className="font-mono text-[9px] bg-stone-200 px-1.5 py-0.5 rounded font-bold">
-                          Ping
-                        </span>
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Column 3 */}
-                  <div>
-                    <h4 className="text-xs font-bold font-mono text-slate-400 uppercase tracking-wider mb-2">
-                      Mode Database &amp; CORS
-                    </h4>
-                    <div className="p-4 bg-stone-50 rounded-2xl border border-stone-200 text-xs">
-                      <div className="flex justify-between items-center mb-1">
-                        <span className="text-stone-500 font-medium">
-                          Database Host:
-                        </span>
-                        <span
-                          className="font-mono text-[10px] truncate max-w-30 bg-stone-200 px-1.5 rounded font-bold"
-                          title={FIREBASE_HOST}
-                        >
-                          {FIREBASE_HOST}
-                        </span>
-                      </div>
-                      <div className="flex justify-between items-center mb-1.5">
-                        <span className="text-stone-500 font-medium">
-                          Status CORS:
-                        </span>
-                        <span
-                          className={`font-semibold ${isConnected ? "text-emerald-700" : "text-amber-700"}`}
-                        >
-                          {isConnected
-                            ? "Lancar (Database)"
-                            : "Menggunakan Mock local"}
-                        </span>
-                      </div>
-                      <p className="text-[10px] text-stone-400 leading-snug">
-                        {isConnected
-                          ? "Berhasil terhubung ke Firebase RTDB milik Anda!"
-                          : "Gagal terhubung ke host. Jangan khawatir, dashboard beralih ke simulasi interaktif."}
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
         </div>
 
         {/* Dashboard Core Layout */}
@@ -1791,6 +1848,69 @@ export default function App() {
                   >
                     Hapus Izin
                   </button>
+                )}
+              </div>
+
+              {/* Riwayat Izin Tebang: semua izin yang PERNAH dibuat, terpisah
+                  dari jadwal aktif di atas -- supaya bisa dilihat berapa kali
+                  izin tebang pernah diterbitkan sepanjang waktu. */}
+              <div className="mt-6 pt-4 border-t border-stone-100">
+                <div className="flex items-center justify-between mb-3">
+                  <h4 className="font-serif text-sm font-bold text-emerald-950">
+                    Riwayat Izin Tebang
+                  </h4>
+                  <div className="flex items-center gap-2">
+                    <span className="bg-stone-100 text-stone-600 font-mono text-[10px] font-bold px-2 py-0.5 rounded-full border border-stone-200">
+                      {Object.keys(permitHistory).length}x pernah dibuat
+                    </span>
+                    {Object.keys(permitHistory).length > 0 && (
+                      <button
+                        onClick={clearAllPermitHistory}
+                        className="px-2.5 py-1 bg-white border border-red-200 hover:bg-red-50 text-red-600 text-[10px] font-bold rounded-lg transition-colors"
+                      >
+                        Hapus Semua
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {Object.keys(permitHistory).length === 0 ? (
+                  <p className="text-xs text-stone-400 py-2">
+                    Belum ada riwayat izin tebang yang tercatat.
+                  </p>
+                ) : (
+                  <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                    {(Object.values(permitHistory) as PermitHistoryEntry[])
+                      .sort((a, b) => b.created_at - a.created_at)
+                      .map((entry) => (
+                        <div
+                          key={entry.id}
+                          className="flex items-start justify-between gap-2 p-2.5 bg-[#FAFBF7] border border-[#D1DBCA]/60 rounded-xl text-xs"
+                        >
+                          <div>
+                            <div className="text-stone-700 font-medium">
+                              {new Date(entry.start_ts).toLocaleString("id-ID")}{" "}
+                              &rarr;{" "}
+                              {new Date(entry.end_ts).toLocaleString("id-ID")}
+                            </div>
+                            {entry.note && (
+                              <div className="text-stone-500 text-[11px] mt-0.5">
+                                {entry.note}
+                              </div>
+                            )}
+                            <div className="text-stone-400 text-[10px] font-mono mt-0.5">
+                              Dibuat {formatTimestamp(entry.created_at)}
+                            </div>
+                          </div>
+                          <button
+                            onClick={() => deletePermitHistoryEntry(entry.id)}
+                            className="shrink-0 px-2 py-1 bg-white border border-red-200 hover:bg-red-50 text-red-600 text-[10px] font-bold rounded-lg transition-colors"
+                          >
+                            Hapus
+                          </button>
+                        </div>
+                      ))}
+                  </div>
                 )}
               </div>
             </div>
@@ -1956,9 +2076,49 @@ export default function App() {
                         <span
                           className={`w-2 h-2 rounded-full ${isOffline ? "bg-stone-300" : "bg-emerald-500"}`}
                         />
-                        <span className="font-semibold text-stone-800">
-                          {node.name || id}
-                        </span>
+                        {editingNameNodeId === id ? (
+                          <div className="flex items-center gap-1.5">
+                            <input
+                              type="text"
+                              value={editNameValue}
+                              onChange={(e) => setEditNameValue(e.target.value)}
+                              placeholder="Nama kustom node"
+                              className="w-32 text-xs border border-[#D1DBCA] rounded-lg px-2 py-1"
+                            />
+                            <button
+                              onClick={() => saveNodeName(id)}
+                              disabled={isSavingName}
+                              className="px-2 py-1 bg-emerald-700 hover:bg-emerald-800 text-white text-[10px] font-bold rounded-lg disabled:opacity-50"
+                            >
+                              Simpan
+                            </button>
+                            <button
+                              onClick={() => setEditingNameNodeId(null)}
+                              className="px-2 py-1 bg-stone-100 hover:bg-stone-200 text-stone-600 text-[10px] font-bold rounded-lg"
+                            >
+                              Batal
+                            </button>
+                          </div>
+                        ) : (
+                          <>
+                            <span className="font-semibold text-stone-800">
+                              {node.name || id}
+                            </span>
+                            <span className="font-mono text-[9px] text-stone-400 bg-stone-50 border border-stone-150 px-1.5 py-0.5 rounded-full">
+                              ID: {id}
+                            </span>
+                            <button
+                              onClick={() => {
+                                setEditingNameNodeId(id);
+                                setEditNameValue(node.name || "");
+                              }}
+                              title="Ganti nama tampilan node ini (ID perangkat tetap tidak berubah)"
+                              className="px-2 py-0.5 bg-white border border-[#D1DBCA] hover:bg-stone-50 text-stone-500 text-[10px] font-bold rounded-lg"
+                            >
+                              Ganti Nama
+                            </button>
+                          </>
+                        )}
                         {isOffline && (
                           <span className="text-[10px] font-mono font-bold text-stone-500 bg-stone-100 px-2 py-0.5 rounded-full border border-stone-200">
                             Tidak terdeteksi sejak {timeAgo(node.last_seen)}
@@ -2057,11 +2217,11 @@ export default function App() {
                   {/* Render nodes onto stylized grid */}
                   {Object.entries(nodes).map(
                     ([id, node]: [string, any], idx) => {
+                      const nodeIsFresh =
+                        !!node.last_seen &&
+                        Date.now() - node.last_seen < NODE_OFFLINE_THRESHOLD_MS;
                       const isNodeAlerting =
-                        alerts &&
-                        (Object.values(alerts) as AlertItem[]).some(
-                          (a) => a.node_id === id && !a.acknowledged,
-                        );
+                        node.detected === true && nodeIsFresh;
 
                       // Simple offset styling for visual spread
                       const offsetStyles = [
@@ -2161,19 +2321,22 @@ export default function App() {
                       <th className="py-3 px-2">Garis Bujur (Lng)</th>
                       <th className="py-3 px-2">Kondisi</th>
                       <th className="py-3 px-2">Terakhir Aktif</th>
+                      <th className="py-3 px-2">Log Belum Ditinjau</th>
                       <th className="py-3 px-2 text-right">Peta GPS</th>
                     </tr>
                   </thead>
                   <tbody className="text-sm divide-y divide-stone-100">
                     {Object.entries(nodes).map(([id, node]: [string, any]) => {
-                      const isNodeAlerting =
-                        alerts &&
-                        (Object.values(alerts) as AlertItem[]).some(
-                          (a) => a.node_id === id && !a.acknowledged,
-                        );
                       const isOffline =
-                        node.last_seen &&
+                        !node.last_seen ||
                         Date.now() - node.last_seen > NODE_OFFLINE_THRESHOLD_MS;
+                      const isNodeAlerting =
+                        node.detected === true && !isOffline;
+                      const nodeUnackCount = (
+                        Object.values(alerts) as AlertItem[]
+                      ).filter(
+                        (a) => a.node_id === id && !a.acknowledged,
+                      ).length;
 
                       return (
                         <tr
@@ -2218,7 +2381,24 @@ export default function App() {
                             </span>
                           </td>
                           <td className="py-4 px-2 font-mono text-[11px] text-stone-500">
-                            {node.last_seen ? timeAgo(node.last_seen) : "–"}
+                            {node.last_seen
+                              ? timeAgo(node.last_seen)
+                              : "Belum pernah lapor"}
+                          </td>
+                          <td className="py-4 px-2">
+                            {nodeUnackCount > 0 ? (
+                              <button
+                                onClick={() => acknowledgeNodeAlerts(id)}
+                                className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-amber-50 hover:bg-amber-100 border border-amber-200 text-amber-800 rounded-lg text-[10px] font-bold transition-colors cursor-pointer"
+                                title="Tandai semua log alarm milik node ini sebagai sudah ditinjau (node lain tidak terpengaruh)"
+                              >
+                                {nodeUnackCount} log · Tandai Ditinjau
+                              </button>
+                            ) : (
+                              <span className="text-[10px] font-mono text-stone-400">
+                                Tidak ada
+                              </span>
+                            )}
                           </td>
                           <td className="py-4 px-2 text-right">
                             <a
@@ -2254,9 +2434,20 @@ export default function App() {
                   </p>
                 </div>
 
-                <span className="bg-emerald-50 text-emerald-800 font-mono text-[10px] font-bold px-2 py-0.5 rounded-full border border-emerald-100">
-                  {alertList.length} total
-                </span>
+                <div className="flex items-center gap-2">
+                  <span className="bg-emerald-50 text-emerald-800 font-mono text-[10px] font-bold px-2 py-0.5 rounded-full border border-emerald-100">
+                    {alertList.length} total
+                  </span>
+                  {alertList.length > 0 && (
+                    <button
+                      onClick={deleteAllAlertsData}
+                      title="Hapus seluruh data ancaman/log alarm secara permanen"
+                      className="px-2.5 py-1 bg-white border border-red-200 hover:bg-red-50 text-red-600 text-[10px] font-bold rounded-lg transition-colors"
+                    >
+                      Hapus Semua
+                    </button>
+                  )}
+                </div>
               </div>
 
               {alertList.length === 0 ? (
@@ -2310,14 +2501,23 @@ export default function App() {
                             </div>
                           </div>
 
-                          {!alert.acknowledged && (
+                          <div className="flex flex-col gap-1.5 items-end">
+                            {!alert.acknowledged && (
+                              <button
+                                onClick={() => acknowledgeAlert(alert.id)}
+                                className="px-3 py-1.5 text-[10px] font-bold bg-emerald-50 text-emerald-800 hover:bg-emerald-600 hover:text-white border border-emerald-300 rounded-xl shadow-2xs transition-all cursor-pointer"
+                              >
+                                Konfirmasi
+                              </button>
+                            )}
                             <button
-                              onClick={() => acknowledgeAlert(alert.id)}
-                              className="px-3 py-1.5 text-[10px] font-bold bg-emerald-50 text-emerald-800 hover:bg-emerald-600 hover:text-white border border-emerald-300 rounded-xl shadow-2xs transition-all cursor-pointer"
+                              onClick={() => deleteAlert(alert.id)}
+                              title="Hapus catatan log alarm ini secara permanen"
+                              className="px-3 py-1.5 text-[10px] font-bold bg-white text-red-600 hover:bg-red-50 border border-red-200 rounded-xl transition-all cursor-pointer"
                             >
-                              Konfirmasi
+                              Hapus
                             </button>
-                          )}
+                          </div>
                         </div>
                       </div>
                     </div>
