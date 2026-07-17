@@ -30,6 +30,7 @@ interface NodeSensor {
   lat: number;
   lng: number;
   last_seen?: number;
+  detected?: boolean; // status LIVE dari paket LoRa terakhir node ini (bukan riwayat alert)
 }
 
 interface PermitWindow {
@@ -58,29 +59,16 @@ export default function App() {
     "https://lora-c0e72-default-rtdb.asia-southeast1.firebasedatabase.app";
 
   // State
-  const [nodes, setNodes] = useState<Record<string, NodeSensor>>({
-    "node-1": { name: "node-1", lat: -6.99, lng: 110.42 },
-    "node-2": { name: "node-2", lat: -6.9921, lng: 110.4225 },
-  });
-  const [alerts, setAlerts] = useState<Record<string, AlertItem>>({
-    "alert-init-1": {
-      id: "alert-init-1",
-      node_id: "node-1",
-      timestamp: Date.now() - 1000 * 60 * 12, // 12 mins ago
-      confidence: 88,
-      acknowledged: true,
-    },
-    "alert-init-2": {
-      id: "alert-init-2",
-      node_id: "node-2",
-      timestamp: Date.now() - 1000 * 60 * 45, // 45 mins ago
-      confidence: 94,
-      acknowledged: true,
-    },
-  });
-  const [status, setStatus] = useState<FirebaseStatus>({
-    last_seen: Date.now() - 1000 * 15,
-  });
+  // PERBAIKAN: sebelumnya di sini ada data bohongan (node-1/node-2 dengan
+  // koordinat karangan + 2 alert palsu "12 menit lalu"/"45 menit lalu") yang
+  // langsung tampil begitu web dibuka, SEBELUM sempat fetch ke Firebase.
+  // Ini yang bikin dashboard terkesan "mengada-ada" -- padahal cuma ada 1 node
+  // sungguhan. Sekarang mulai kosong; apa pun yang tampil murni hasil fetch
+  // dari Firebase (data node sungguhan akan otomatis muncul begitu gateway
+  // pernah meneruskan minimal 1 paket dari node tersebut).
+  const [nodes, setNodes] = useState<Record<string, NodeSensor>>({});
+  const [alerts, setAlerts] = useState<Record<string, AlertItem>>({});
+  const [status, setStatus] = useState<FirebaseStatus>({ last_seen: 0 });
   const [sensitivity, setSensitivity] = useState<number>(75);
 
   // Ambang waktu untuk anggap sebuah node "mati/tidak terdeteksi": kalau last_seen
@@ -211,12 +199,11 @@ export default function App() {
       console.warn("Firebase fetch error:", err);
       setSyncError(diagnosis);
 
-      // Hanya jatuh ke Modus Simulasi kalau gagal berturut-turut, bukan sekali
-      // gagal saja -- supaya blip jaringan sesaat tidak bikin dashboard
-      // kelihatan seperti data palsu padahal sebenarnya cuma telat sinkron.
+      // VERSI MURNI: tidak pernah beralih ke data tiruan/simulasi. Kalau gagal
+      // konek berkali-kali, dashboard cuma menampilkan status "Tidak
+      // Terhubung" apa adanya -- tidak ada fallback data palsu sama sekali.
       if (consecutiveFailuresRef.current >= MAX_CONSECUTIVE_FAILURES) {
         setIsConnected(false);
-        setIsUsingMock(true);
       }
     } finally {
       setIsSyncing(false);
@@ -432,50 +419,51 @@ export default function App() {
     }
   };
 
-  // Simulator helper: Trigger mock warning on a node
-  const triggerMockAlert = async (nodeId: string) => {
-    const timestamp = Date.now();
-    const confidence = Math.floor(Math.random() * 25) + 75; // 75% to 99%
-    const newAlert = {
-      node_id: nodeId,
-      timestamp,
-      confidence,
-      acknowledged: false,
-    };
+  // VERSI MURNI: fungsi picu alarm palsu (triggerMockAlert) sengaja DIHAPUS.
+  // Semua entri di /alerts.json pada versi ini hanya bisa berasal dari
+  // gateway asli meneruskan deteksi node sensor asli -- tidak ada jalur di
+  // web ini yang bisa menulis alert karangan.
 
-    if (isUsingMock) {
-      // Local state simulation
-      const mockKey = `alert-mock-${Date.now()}`;
-      setAlerts((prev) => ({
-        ...prev,
-        [mockKey]: { id: mockKey, ...newAlert },
-      }));
-      setStatus((prev) => ({ ...prev, last_seen: timestamp }));
-    } else {
-      try {
-        setIsSyncing(true);
-        // POST alert
-        await fetch(`${FIREBASE_URL}/alerts.json`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(newAlert),
-        });
-        // PUT last seen status
-        await fetch(`${FIREBASE_URL}/status/last_seen.json`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ last_seen: timestamp }),
-        });
-        fetchData();
-      } catch (err) {
-        console.error("Simulator triggers error:", err);
-      } finally {
-        setIsSyncing(false);
-      }
+  // Clear or acknowledge all alerts in simulator
+  // PERBAIKAN: sebelumnya cuma ada "Acknowledge Semua Alarm" yang meng-ack
+  // SELURUH alert dari SEMUA node sekaligus -- kalau ada 2 node aktif dan yang
+  // baru diatasi cuma satu, tombol ini keliru ikut menandai node lain sebagai
+  // sudah ditinjau juga. Fungsi ini hanya meng-ack log milik SATU node_id.
+  const acknowledgeNodeAlerts = async (nodeId: string) => {
+    const idsToAck = Object.entries(alerts)
+      .filter(([, a]: [string, any]) => a.node_id === nodeId && !a.acknowledged)
+      .map(([key]) => key);
+    if (idsToAck.length === 0) return;
+
+    setAlerts((prev) => {
+      const updated = { ...prev };
+      idsToAck.forEach((key) => {
+        updated[key] = { ...updated[key], acknowledged: true };
+      });
+      return updated;
+    });
+
+    if (isUsingMock) return;
+
+    try {
+      setIsSyncing(true);
+      await Promise.all(
+        idsToAck.map((key) =>
+          fetch(`${FIREBASE_URL}/alerts/${key}/acknowledged.json`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(true),
+          }),
+        ),
+      );
+      fetchData();
+    } catch (err) {
+      console.error("Firebase ack per-node error:", err);
+    } finally {
+      setIsSyncing(false);
     }
   };
 
-  // Clear or acknowledge all alerts in simulator
   const clearAllAlerts = async () => {
     if (isUsingMock) {
       setAlerts((prev) => {
@@ -515,10 +503,25 @@ export default function App() {
   const unacknowledgedAlerts = alertList.filter(
     (a: AlertItem) => !a.acknowledged,
   );
-  const hasActiveAlert = unacknowledgedAlerts.length > 0;
 
-  // Most recent fresh alert (within last 10 minutes) or simply any active alert
-  const latestActiveAlert: AlertItem | null = unacknowledgedAlerts[0] || null;
+  // PERBAIKAN PENTING: dulu status "AMAN/TERANCAM" ditentukan dari ada/tidaknya
+  // ALERT LAMA yang belum di-"Konfirmasi" -- akibatnya begitu 1 alert (baik
+  // asli maupun dari tombol simulasi) pernah tercatat dan tidak ada yang klik
+  // Konfirmasi, dashboard akan MENAMPILKAN "TERANCAM" SELAMANYA walau ancaman
+  // sudah lama selesai. Sekarang status real-time murni dilihat dari kondisi
+  // LIVE tiap node (field `detected` dari paket LoRa TERAKHIR + apakah node itu
+  // masih "hidup" dalam NODE_OFFLINE_THRESHOLD_MS terakhir) -- begitu node
+  // sensor sendiri melaporkan detected=false (situasi sudah reda), status di
+  // web otomatis kembali AMAN tanpa perlu ada yang klik apa pun secara manual.
+  // Riwayat alert (unacknowledgedAlerts) tetap ada, tapi sekarang murni jadi
+  // LOG/catatan kejadian untuk ditinjau -- tidak lagi mengontrol status utama.
+  const liveThreatEntries = Object.entries(nodes).filter(([, n]) => {
+    const isFresh =
+      !!n.last_seen && Date.now() - n.last_seen < NODE_OFFLINE_THRESHOLD_MS;
+    return n.detected === true && isFresh;
+  });
+  const hasActiveAlert = liveThreatEntries.length > 0;
+  const latestActiveNodeId: string | null = liveThreatEntries[0]?.[0] ?? null;
 
   // Formatting helpers
   const timeAgo = (unixMs: number) => {
@@ -1200,20 +1203,20 @@ export default function App() {
               <span
                 className={`w-2 h-2 rounded-full ${isConnected ? "bg-emerald-500 animate-pulse" : "bg-amber-500"}`}
               />
-              {isConnected ? "Sistem Online" : "Modus Lokal Terisolasi"}
+              {isConnected ? "Sistem Online" : "Terputus dari Firebase"}
             </span>
 
-            {isUsingMock && (
+            {!isConnected && (
               <span
                 className="inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-mono font-medium bg-amber-100 text-amber-900 border border-amber-200 cursor-help"
                 title={syncError ?? "Gagal terhubung ke Firebase berkali-kali."}
               >
-                <Sparkles className="w-3.5 h-3.5" />
-                Menggunakan Data Simulasi Cepat
+                <WifiOff className="w-3.5 h-3.5" />
+                Tidak ada data real -- cek koneksi/Firebase Rules
               </span>
             )}
           </div>
-          {isUsingMock && syncError && (
+          {!isConnected && syncError && (
             <p className="text-xs text-amber-700 font-mono mt-1">{syncError}</p>
           )}
 
@@ -1396,8 +1399,8 @@ export default function App() {
                   </div>
                   <p className="text-stone-500 text-sm mt-2 max-w-xl">
                     {hasActiveAlert
-                      ? `Ancaman gergaji mesin aktif dilaporkan di Node ${latestActiveAlert?.node_id}. Amplitudo suara terindikasi tinggi. Segera arahkan tim patroli rimbawan ke koordinat lokasi.`
-                      : "Sistem akustik tidak menangkap adanya sinyal frekuensi abnormal yang menyerupai gergaji mesin (chainsaw). Konservasi hutan aman dari pembalakan liar."}
+                      ? `Gergaji mesin SEDANG terdeteksi live di Node ${latestActiveNodeId}. Segera arahkan tim patroli rimbawan ke koordinat lokasi. Status ini otomatis kembali AMAN begitu node melaporkan situasi reda.`
+                      : "Sistem akustik tidak menangkap adanya sinyal frekuensi abnormal yang menyerupai gergaji mesin (chainsaw) dari node yang sedang online. Konservasi hutan aman dari pembalakan liar."}
                   </p>
                 </div>
 
@@ -1409,21 +1412,19 @@ export default function App() {
                     <p
                       className={`text-lg font-bold italic ${hasActiveAlert ? "text-red-700" : "text-slate-700"}`}
                     >
-                      {hasActiveAlert && latestActiveAlert
-                        ? `Node ${latestActiveAlert.node_id}`
+                      {hasActiveAlert && latestActiveNodeId
+                        ? `Node ${latestActiveNodeId}`
                         : "Tidak Ada"}
                     </p>
                   </div>
                   <div>
                     <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-                      Confidence Score
+                      Alert Belum Ditinjau
                     </p>
                     <p
-                      className={`text-lg font-bold ${hasActiveAlert && latestActiveAlert ? "text-red-600" : "text-emerald-600"}`}
+                      className={`text-lg font-bold ${unacknowledgedAlerts.length > 0 ? "text-amber-600" : "text-emerald-600"}`}
                     >
-                      {hasActiveAlert && latestActiveAlert
-                        ? `${latestActiveAlert.confidence}%`
-                        : "0.02%"}
+                      {unacknowledgedAlerts.length}
                     </p>
                   </div>
                 </div>
@@ -1490,148 +1491,6 @@ export default function App() {
               <span>915 MHz LoRa</span>
             </div>
           </div>
-        </div>
-
-        {/* Developer Sandbox Panel - Collapsible */}
-        <div className="mb-8 bg-white border border-[#D1DBCA] rounded-3xl overflow-hidden shadow-xs">
-          <button
-            onClick={() => setShowSandbox(!showSandbox)}
-            className="w-full px-6 py-5 bg-[#E8F0E3]/60 flex justify-between items-center text-left hover:bg-[#E8F0E3] transition-all duration-300 border-t border-[#D1DBCA]"
-          >
-            <div className="flex items-center gap-3 text-emerald-950">
-              <div className="p-2 bg-white rounded-xl shadow-xs text-emerald-800">
-                <Sliders className="w-4 h-4" />
-              </div>
-              <div>
-                <span className="font-serif font-bold text-sm tracking-tight">
-                  🛠️ Ruang Simulasi &amp; Pengetesan Alat (Sandbox)
-                </span>
-                <p className="text-[11px] text-stone-500 font-normal">
-                  Picu sinyal tiruan untuk mencoba fungsionalitas visual web
-                  dashboard Anda
-                </p>
-              </div>
-            </div>
-            {showSandbox ? (
-              <ChevronUp className="w-4 h-4 text-stone-600" />
-            ) : (
-              <ChevronDown className="w-4 h-4 text-stone-600" />
-            )}
-          </button>
-
-          <AnimatePresence>
-            {showSandbox && (
-              <motion.div
-                initial={{ height: 0, opacity: 0 }}
-                animate={{ height: "auto", opacity: 1 }}
-                exit={{ height: 0, opacity: 0 }}
-                className="overflow-hidden border-t border-[#D1DBCA]"
-              >
-                <div className="p-6 grid grid-cols-1 md:grid-cols-3 gap-6 bg-white">
-                  {/* Column 1 */}
-                  <div>
-                    <h4 className="text-xs font-bold font-mono text-slate-400 uppercase tracking-wider mb-2">
-                      Picu Alarm Palsu
-                    </h4>
-                    <div className="flex flex-col gap-2">
-                      <button
-                        onClick={() => triggerMockAlert("node-1")}
-                        className="w-full text-left px-3 py-2.5 rounded-xl text-xs font-semibold bg-red-50 text-red-800 border border-red-200 hover:bg-red-100 transition-colors flex justify-between items-center cursor-pointer"
-                      >
-                        <span>Picu Chainsaw di Node-1</span>
-                        <span className="font-mono text-[9px] bg-red-200/60 px-1.5 py-0.5 rounded font-bold">
-                          Trigger
-                        </span>
-                      </button>
-                      <button
-                        onClick={() => triggerMockAlert("node-2")}
-                        className="w-full text-left px-3 py-2.5 rounded-xl text-xs font-semibold bg-red-50 text-red-800 border border-red-200 hover:bg-red-100 transition-colors flex justify-between items-center cursor-pointer"
-                      >
-                        <span>Picu Chainsaw di Node-2</span>
-                        <span className="font-mono text-[9px] bg-red-200/60 px-1.5 py-0.5 rounded font-bold">
-                          Trigger
-                        </span>
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Column 2 */}
-                  <div>
-                    <h4 className="text-xs font-bold font-mono text-slate-400 uppercase tracking-wider mb-2">
-                      Reset Status Hutan
-                    </h4>
-                    <div className="flex flex-col gap-2">
-                      <button
-                        onClick={clearAllAlerts}
-                        className="w-full text-left px-3 py-2.5 rounded-xl text-xs font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 hover:bg-emerald-100 transition-colors flex justify-between items-center cursor-pointer"
-                      >
-                        <span>Acknowledge Semua Alarm</span>
-                        <span className="font-mono text-[9px] bg-emerald-200/60 px-1.5 py-0.5 rounded font-bold">
-                          Reset
-                        </span>
-                      </button>
-
-                      <button
-                        onClick={() => {
-                          setStatus({ last_seen: Date.now() });
-                          if (!isUsingMock) {
-                            fetch(`${FIREBASE_URL}/status/last_seen.json`, {
-                              method: "PUT",
-                              headers: { "Content-Type": "application/json" },
-                              body: JSON.stringify({ last_seen: Date.now() }),
-                            });
-                          }
-                        }}
-                        className="w-full text-left px-3 py-2.5 rounded-xl text-xs font-semibold bg-stone-50 text-stone-700 border border-stone-200 hover:bg-stone-100 transition-colors flex justify-between items-center cursor-pointer"
-                      >
-                        <span>Picu Ping Gateway (Now)</span>
-                        <span className="font-mono text-[9px] bg-stone-200 px-1.5 py-0.5 rounded font-bold">
-                          Ping
-                        </span>
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Column 3 */}
-                  <div>
-                    <h4 className="text-xs font-bold font-mono text-slate-400 uppercase tracking-wider mb-2">
-                      Mode Database &amp; CORS
-                    </h4>
-                    <div className="p-4 bg-stone-50 rounded-2xl border border-stone-200 text-xs">
-                      <div className="flex justify-between items-center mb-1">
-                        <span className="text-stone-500 font-medium">
-                          Database Host:
-                        </span>
-                        <span
-                          className="font-mono text-[10px] truncate max-w-30 bg-stone-200 px-1.5 rounded font-bold"
-                          title={FIREBASE_HOST}
-                        >
-                          {FIREBASE_HOST}
-                        </span>
-                      </div>
-                      <div className="flex justify-between items-center mb-1.5">
-                        <span className="text-stone-500 font-medium">
-                          Status CORS:
-                        </span>
-                        <span
-                          className={`font-semibold ${isConnected ? "text-emerald-700" : "text-amber-700"}`}
-                        >
-                          {isConnected
-                            ? "Lancar (Database)"
-                            : "Menggunakan Mock local"}
-                        </span>
-                      </div>
-                      <p className="text-[10px] text-stone-400 leading-snug">
-                        {isConnected
-                          ? "Berhasil terhubung ke Firebase RTDB milik Anda!"
-                          : "Gagal terhubung ke host. Jangan khawatir, dashboard beralih ke simulasi interaktif."}
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
         </div>
 
         {/* Dashboard Core Layout */}
@@ -2057,11 +1916,11 @@ export default function App() {
                   {/* Render nodes onto stylized grid */}
                   {Object.entries(nodes).map(
                     ([id, node]: [string, any], idx) => {
+                      const nodeIsFresh =
+                        !!node.last_seen &&
+                        Date.now() - node.last_seen < NODE_OFFLINE_THRESHOLD_MS;
                       const isNodeAlerting =
-                        alerts &&
-                        (Object.values(alerts) as AlertItem[]).some(
-                          (a) => a.node_id === id && !a.acknowledged,
-                        );
+                        node.detected === true && nodeIsFresh;
 
                       // Simple offset styling for visual spread
                       const offsetStyles = [
@@ -2161,19 +2020,21 @@ export default function App() {
                       <th className="py-3 px-2">Garis Bujur (Lng)</th>
                       <th className="py-3 px-2">Kondisi</th>
                       <th className="py-3 px-2">Terakhir Aktif</th>
+                      <th className="py-3 px-2">Log Belum Ditinjau</th>
                       <th className="py-3 px-2 text-right">Peta GPS</th>
                     </tr>
                   </thead>
                   <tbody className="text-sm divide-y divide-stone-100">
                     {Object.entries(nodes).map(([id, node]: [string, any]) => {
-                      const isNodeAlerting =
-                        alerts &&
-                        (Object.values(alerts) as AlertItem[]).some(
-                          (a) => a.node_id === id && !a.acknowledged,
-                        );
                       const isOffline =
-                        node.last_seen &&
+                        !node.last_seen ||
                         Date.now() - node.last_seen > NODE_OFFLINE_THRESHOLD_MS;
+                      const isNodeAlerting =
+                        node.detected === true && !isOffline;
+                      const nodeUnackCount = (
+                        Object.values(alerts) as AlertItem[]
+                      ).filter((a) => a.node_id === id && !a.acknowledged)
+                        .length;
 
                       return (
                         <tr
@@ -2218,7 +2079,22 @@ export default function App() {
                             </span>
                           </td>
                           <td className="py-4 px-2 font-mono text-[11px] text-stone-500">
-                            {node.last_seen ? timeAgo(node.last_seen) : "–"}
+                            {node.last_seen ? timeAgo(node.last_seen) : "Belum pernah lapor"}
+                          </td>
+                          <td className="py-4 px-2">
+                            {nodeUnackCount > 0 ? (
+                              <button
+                                onClick={() => acknowledgeNodeAlerts(id)}
+                                className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-amber-50 hover:bg-amber-100 border border-amber-200 text-amber-800 rounded-lg text-[10px] font-bold transition-colors cursor-pointer"
+                                title="Tandai semua log alarm milik node ini sebagai sudah ditinjau (node lain tidak terpengaruh)"
+                              >
+                                {nodeUnackCount} log · Tandai Ditinjau
+                              </button>
+                            ) : (
+                              <span className="text-[10px] font-mono text-stone-400">
+                                Tidak ada
+                              </span>
+                            )}
                           </td>
                           <td className="py-4 px-2 text-right">
                             <a
