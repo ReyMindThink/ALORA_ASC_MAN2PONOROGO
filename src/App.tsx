@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   TreePine,
   Radio,
@@ -55,7 +55,7 @@ export default function App() {
   const FIREBASE_HOST =
     "lora-c0e72-default-rtdb.asia-southeast1.firebasedatabase.app";
   const FIREBASE_URL =
-    "https://lora-c0e72-default-rtdb.asia-southeast1.firebasedatabase.app";
+    "lora-c0e72-default-rtdb.asia-southeast1.firebasedatabase.app";
 
   // State
   const [nodes, setNodes] = useState<Record<string, NodeSensor>>({
@@ -112,6 +112,12 @@ export default function App() {
   const [showHtmlExport, setShowHtmlExport] = useState<boolean>(false);
   const [syncError, setSyncError] = useState<string | null>(null);
 
+  // Berapa kali fetch gagal berturut-turut sebelum dashboard benar-benar dianggap
+  // "putus" dan pindah ke Modus Simulasi. Ini mencegah satu kegagalan sesaat (jitter
+  // jaringan, request lambat, dsb.) langsung membuat dashboard terlihat "palsu".
+  const consecutiveFailuresRef = useRef(0);
+  const MAX_CONSECUTIVE_FAILURES = 3;
+
   // Poll intervals
   useEffect(() => {
     fetchData();
@@ -121,7 +127,6 @@ export default function App() {
 
   const fetchData = async () => {
     setIsSyncing(true);
-    setSyncError(null);
     try {
       // 1. Fetch status
       const statusRes = await fetch(`${FIREBASE_URL}/status.json`);
@@ -183,17 +188,36 @@ export default function App() {
         }
       }
 
+      // Fetch berhasil penuh: reset penghitung kegagalan dan kembalikan dashboard
+      // ke mode data asli (kalau sebelumnya sempat jatuh ke simulasi).
+      consecutiveFailuresRef.current = 0;
       setIsConnected(true);
       setIsUsingMock(false);
+      setSyncError(null);
       setLastSynced(new Date());
     } catch (err: any) {
-      console.warn(
-        "Firebase fetch error. Dashboard will run on interactive simulation mode:",
-        err,
-      );
-      setIsConnected(false);
-      setIsUsingMock(true);
-      setSyncError(err?.message || "CORS / Offline");
+      consecutiveFailuresRef.current += 1;
+
+      // Bedakan penyebabnya biar gampang didiagnosis: TypeError dari fetch()
+      // hampir selalu berarti CORS diblokir atau memang tidak ada koneksi ke
+      // internet, sedangkan error lain (yang kita lempar sendiri di atas)
+      // biasanya HTTP non-200, contoh paling umum: Firebase Rules belum
+      // mengizinkan "read" publik.
+      const isLikelyCorsOrOffline = err instanceof TypeError;
+      const diagnosis = isLikelyCorsOrOffline
+        ? "Tidak bisa terhubung ke Firebase (kemungkinan CORS diblokir atau tidak ada koneksi internet)."
+        : `Firebase menolak permintaan: ${err?.message || "error tidak diketahui"}. Cek Firebase Realtime Database > Rules, pastikan "read" diizinkan.`;
+
+      console.warn("Firebase fetch error:", err);
+      setSyncError(diagnosis);
+
+      // Hanya jatuh ke Modus Simulasi kalau gagal berturut-turut, bukan sekali
+      // gagal saja -- supaya blip jaringan sesaat tidak bikin dashboard
+      // kelihatan seperti data palsu padahal sebenarnya cuma telat sinkron.
+      if (consecutiveFailuresRef.current >= MAX_CONSECUTIVE_FAILURES) {
+        setIsConnected(false);
+        setIsUsingMock(true);
+      }
     } finally {
       setIsSyncing(false);
     }
@@ -1180,12 +1204,18 @@ export default function App() {
             </span>
 
             {isUsingMock && (
-              <span className="inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-mono font-medium bg-amber-100 text-amber-900 border border-amber-200">
+              <span
+                className="inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-mono font-medium bg-amber-100 text-amber-900 border border-amber-200 cursor-help"
+                title={syncError ?? "Gagal terhubung ke Firebase berkali-kali."}
+              >
                 <Sparkles className="w-3.5 h-3.5" />
                 Menggunakan Data Simulasi Cepat
               </span>
             )}
           </div>
+          {isUsingMock && syncError && (
+            <p className="text-xs text-amber-700 font-mono mt-1">{syncError}</p>
+          )}
 
           <div className="text-xs text-stone-500 font-mono flex items-center gap-2">
             <span>Terakhir sinkron: {lastSynced.toLocaleTimeString()}</span>
