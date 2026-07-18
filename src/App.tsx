@@ -136,6 +136,20 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
+  // Firmware ESP32 (time()/NTP) umumnya mengirim unix timestamp dalam
+  // DETIK, sedangkan Date.now() & new Date() di JS bekerja dalam MILIDETIK.
+  // Kalau nilai detik itu langsung dipakai sebagai ms tanpa dikonversi,
+  // selisihnya jadi ~1000x lipat -- ini penyebab tulisan aneh semacam
+  // "20629 hari lalu" padahal datanya baru saja masuk. Normalisasi dilakukan
+  // sekali di sini, tepat saat data masuk dari Firebase, supaya seluruh
+  // state (nodes, alerts, status) sudah konsisten dalam ms.
+  const toMs = (ts?: number | null): number => {
+    if (!ts) return 0;
+    // Timestamp era sekarang dalam ms selalu > 1e12 (~ tahun 2001+).
+    // Kalau nilainya lebih kecil dari itu, hampir pasti itu detik -> x1000.
+    return ts < 1e12 ? ts * 1000 : ts;
+  };
+
   const fetchData = async () => {
     setIsSyncing(true);
     try {
@@ -143,14 +157,26 @@ export default function App() {
       const statusRes = await fetch(`${FIREBASE_URL}/status.json`);
       if (!statusRes.ok) throw new Error(`HTTP status: ${statusRes.status}`);
       const statusData = await statusRes.json();
-      if (statusData) setStatus(statusData);
+      if (statusData) {
+        setStatus({
+          ...statusData,
+          last_seen: toMs(statusData.last_seen),
+        });
+      }
 
       // 2. Fetch nodes
       const nodesRes = await fetch(`${FIREBASE_URL}/nodes.json`);
       if (!nodesRes.ok) throw new Error(`HTTP nodes: ${nodesRes.status}`);
       const nodesData = await nodesRes.json();
       if (nodesData) {
-        setNodes(nodesData);
+        const normalizedNodes: Record<string, NodeSensor> = {};
+        Object.entries(nodesData).forEach(([key, val]: [string, any]) => {
+          normalizedNodes[key] = {
+            ...val,
+            last_seen: toMs(val?.last_seen),
+          };
+        });
+        setNodes(normalizedNodes);
       }
 
       // 3. Fetch alerts
@@ -164,7 +190,7 @@ export default function App() {
           normalized[key] = {
             id: key,
             node_id: val.node_id || "node-unknown",
-            timestamp: val.timestamp || Date.now(),
+            timestamp: val.timestamp ? toMs(val.timestamp) : Date.now(),
             confidence: val.confidence || 90,
             acknowledged:
               typeof val.acknowledged === "boolean" ? val.acknowledged : false,
@@ -1260,7 +1286,14 @@ export default function App() {
     let latestAlerts = {};
     let latestNodes = {};
 
-    function timeAgo(unixMs) {
+    // Firmware mengirim unix timestamp dalam detik, JS butuh milidetik.
+    function toMs(ts) {
+      if (!ts) return 0;
+      return ts < 1e12 ? ts * 1000 : ts;
+    }
+
+    function timeAgo(unixTs) {
+      const unixMs = toMs(unixTs);
       if(!unixMs) return "–";
       const diff = Math.floor((Date.now() - unixMs) / 1000);
       if(diff < 5) return "baru saja";
@@ -1341,7 +1374,7 @@ export default function App() {
           timelineContainer.innerHTML = alerts.slice(0, 8).map(a => {
             return \`
               <div class="timeline-item \${a.acknowledged ? 'ack' : ''}">
-                <div class="time-stamp">\${new Date(a.timestamp).toLocaleTimeString('id-ID')}</div>
+                <div class="time-stamp">\${new Date(toMs(a.timestamp)).toLocaleTimeString('id-ID')}</div>
                 <div class="timeline-body">
                   <div>
                     <div class="alert-node-title">🚨 Node \${a.node_id}</div>
